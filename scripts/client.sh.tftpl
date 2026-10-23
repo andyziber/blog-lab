@@ -1,0 +1,101 @@
+#!/bin/bash
+# client first-boot setup: capture and analysis tooling plus the benign beacon.
+#
+# This file is a Terraform template. Literal dollar-brace and percent-brace
+# sequences meant for bash and curl are doubled ($$ and %%) so Terraform
+# leaves them alone; plain $VAR needs no escaping.
+#
+# Each tool installs independently. A failure is logged to
+# /var/lib/blog-lab/failed and the rest of the setup carries on.
+set -uo pipefail
+exec > >(tee -a /var/log/blog-lab-setup.log) 2>&1
+export DEBIAN_FRONTEND=noninteractive
+
+mkdir -p /var/lib/blog-lab
+step() { echo "=== $1"; }
+fail() { echo "!!! FAILED: $1" | tee -a /var/lib/blog-lab/failed; }
+
+IFACE=$(ip -o -4 route show to default | awk '{print $5}')
+
+# --- Base tools -------------------------------------------------------------
+step "base packages"
+apt-get update
+apt-get install -y tcpdump tshark jq curl gnupg git software-properties-common pipx \
+  || fail "base packages"
+
+# --- Zeek (official OBS repository) ----------------------------------------
+step "zeek"
+# zeekctl pulls in postfix; answer its prompt up front.
+echo "postfix postfix/main_mailer_type select No configuration" | debconf-set-selections
+if curl -fsSL https://download.opensuse.org/repositories/security:zeek/xUbuntu_24.04/Release.key \
+     | gpg --dearmor -o /etc/apt/trusted.gpg.d/security_zeek.gpg \
+   && echo 'deb http://download.opensuse.org/repositories/security:/zeek/xUbuntu_24.04/ /' \
+     > /etc/apt/sources.list.d/security-zeek.list \
+   && apt-get update \
+   && apt-get install -y zeek; then
+  echo "zeek installed: $(/opt/zeek/bin/zeek --version)"
+else
+  fail "zeek"
+fi
+
+# --- Suricata (OISF stable PPA) + ET Open rules ----------------------------
+step "suricata"
+if add-apt-repository -y ppa:oisf/suricata-stable \
+   && apt-get update \
+   && apt-get install -y suricata; then
+  # The packaged config assumes eth0; EC2 Nitro interfaces are ens5.
+  sed -i "s/interface: eth0/interface: $IFACE/g" /etc/suricata/suricata.yaml
+  [ -f /etc/default/suricata ] && sed -i "s/^IFACE=.*/IFACE=$IFACE/" /etc/default/suricata
+  suricata-update || fail "suricata-update"
+  systemctl enable suricata
+  systemctl restart suricata || fail "suricata service"
+else
+  fail "suricata"
+fi
+
+# --- mitmproxy (pipx, installed system-wide) -------------------------------
+step "mitmproxy"
+PIPX_HOME=/opt/pipx PIPX_BIN_DIR=/usr/local/bin pipx install mitmproxy || fail "mitmproxy"
+
+# --- Lab environment and helpers -------------------------------------------
+step "lab helpers"
+cat > /etc/profile.d/blog-lab.sh <<EOF
+export C2_IP=${c2_ip}
+export LAB_IFACE=$IFACE
+export PATH=/opt/zeek/bin:\$PATH
+EOF
+
+# Benign simulated beacon: an HTTPS GET to the lab c2-server on a fixed
+# interval with jitter. It sends nothing but the request itself.
+cat > /usr/local/bin/beacon <<'EOF'
+#!/bin/bash
+# Usage: beacon [interval_seconds] [jitter_seconds]    (defaults: 60 10)
+C2="$${C2_IP:-${c2_ip}}"
+BASE="$${1:-60}"
+JITTER="$${2:-10}"
+echo "beaconing to https://$C2/checkin every $BASE +/- $JITTER s (Ctrl+C to stop)"
+while true; do
+  curl -sk -o /dev/null -w "%%{http_code} $(date -u +%H:%M:%S)\n" "https://$C2/checkin"
+  sleep $(( BASE - JITTER + RANDOM % (2 * JITTER + 1) ))
+done
+EOF
+chmod 755 /usr/local/bin/beacon
+
+# Capture helper: capture <name> [bpf filter...]
+cat > /usr/local/bin/capture <<'EOF'
+#!/bin/bash
+# Usage: capture <name> [bpf filter]    e.g. capture beacon "host $C2_IP"
+NAME="$${1:?usage: capture <name> [bpf filter]}"
+shift
+IFACE="$${LAB_IFACE:-$(ip -o -4 route show to default | awk '{print $5}')}"
+mkdir -p "$HOME/captures"
+OUT="$HOME/captures/$NAME-$(date -u +%Y%m%dT%H%M%SZ).pcap"
+echo "capturing on $IFACE to $OUT (Ctrl+C to stop)"
+sudo tcpdump -i "$IFACE" -w "$OUT" "$@"
+EOF
+chmod 755 /usr/local/bin/capture
+
+touch /var/lib/blog-lab/setup-done
+echo "=== client setup complete"
+[ -f /var/lib/blog-lab/failed ] && { echo "Some steps failed:"; cat /var/lib/blog-lab/failed; }
+exit 0

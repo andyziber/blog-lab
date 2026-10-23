@@ -1,0 +1,20 @@
+**/.terraform/
+*.tfstate
+*.tfstate.*
+crash.log
+crash.*.log
+.terraformrc
+terraform.rc
+
+# terraform.tfvars holds the alert email address. Never commit it.
+terraform.tfvars
+*.tfvars.json
+!terraform.tfvars.example
+
+# Lab output. Captures and TLS key logs can contain secrets and identifying
+# addresses; they stay on the instance or in a local, uncommitted folder.
+*.pcap
+*.pcapng
+*sslkeys*.log
+*keylog*.log
+captures/

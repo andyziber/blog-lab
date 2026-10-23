@@ -1,0 +1,2 @@
+# user_data scripts run on Linux; CRLF line endings break bash.
+* text=auto eol=lf
